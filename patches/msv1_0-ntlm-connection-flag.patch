@@ -1,0 +1,12 @@
+diff --git a/dlls/msv1_0/main.c b/dlls/msv1_0/main.c
+index 076cf92..aa80412 100644
+--- a/dlls/msv1_0/main.c
++++ b/dlls/msv1_0/main.c
+@@ -1464,6 +1464,7 @@ static NTSTATUS NTAPI ntlm_SpInitLsaModeContext( LSA_SEC_HANDLE cred_handle, LSA
+             *ctx_attr |= ISC_RET_INTEGRITY | ISC_RET_SEQUENCE_DETECT | ISC_RET_REPLAY_DETECT;
+         if (ctx->req_attrs & ISC_REQ_CONFIDENTIALITY && challenge->negotiate_flags & NTLMSSP_NEGOTIATE_SEAL)
+             *ctx_attr |= ISC_RET_CONFIDENTIALITY;
++        if (ctx->req_attrs & ISC_REQ_CONNECTION) *ctx_attr |= ISC_RET_CONNECTION;
+ 
+         if (ctx->token && !local_auth_authenticate( challenge->challenge, ctx->token, ctx->session_key ))
+         {

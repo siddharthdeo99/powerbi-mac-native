@@ -1,0 +1,458 @@
+diff --git a/dlls/win32u/dce.c b/dlls/win32u/dce.c
+index 0ea79d7..4cbf67b 100644
+--- a/dlls/win32u/dce.c
++++ b/dlls/win32u/dce.c
+@@ -142,6 +142,434 @@ static void create_offscreen_window_surface( HWND hwnd, const RECT *surface_rect
+     if (previous) window_surface_release( previous );
+ }
+ 
++/*******************************************************************
++ * Cross-process child window surface.
++ *
++ * A child window whose parent belongs to another process cannot draw into the window surface
++ * of its top-level window, which lives in the other process. It draws into a surface shared
++ * through a named section instead, and the process owning the top-level window copies the
++ * visible parts of it into its own surface before flushing.
++ */
++
++#define XPROC_MAGIC       0x58505243
++#define XPROC_HEADER_SIZE 0x1000
++#define XPROC_MAX_WIDTH   4096
++#define XPROC_MAX_HEIGHT  2560
++#define XPROC_SECTION_SIZE (XPROC_HEADER_SIZE + (SIZE_T)XPROC_MAX_WIDTH * XPROC_MAX_HEIGHT * 4)
++
++struct xproc_shared
++{
++    LONG magic;
++    LONG width;
++    LONG height;
++    LONG seq;
++};
++
++struct xproc_surface
++{
++    struct window_surface header;
++    HANDLE section;
++    struct xproc_shared *shared;
++    HWND root;
++};
++
++static void *window_surface_get_color( struct window_surface *surface, BITMAPINFO *info );
++
++static pthread_mutex_t xproc_lock = PTHREAD_MUTEX_INITIALIZER;
++static struct xproc_surface *xproc_surfaces[16];
++
++static HANDLE open_xproc_section( HWND hwnd, BOOL create )
++{
++    OBJECT_ATTRIBUTES attr;
++    UNICODE_STRING str;
++    LARGE_INTEGER size;
++    WCHAR bufferW[64];
++    char buffer[64];
++    HANDLE section;
++
++    snprintf( buffer, sizeof(buffer), "\\KernelObjects\\__wine_xproc_surface_%08x", HandleToUlong( hwnd ) );
++    str.Buffer = bufferW;
++    str.MaximumLength = sizeof(bufferW);
++    str.Length = asciiz_to_unicode( bufferW, buffer ) - sizeof(WCHAR);
++    InitializeObjectAttributes( &attr, &str, OBJ_OPENIF, 0, NULL );
++
++    size.QuadPart = XPROC_SECTION_SIZE;
++    if (create)
++    {
++        if ((LONG)NtCreateSection( &section, SECTION_ALL_ACCESS, &attr, &size, PAGE_READWRITE, SEC_COMMIT, 0 ) < 0)
++            return 0;
++    }
++    else if (NtOpenSection( &section, SECTION_MAP_READ, &attr )) return 0;
++    return section;
++}
++
++static struct xproc_surface *get_xproc_surface_ptr( struct window_surface *surface )
++{
++    return CONTAINING_RECORD( surface, struct xproc_surface, header );
++}
++
++static void xproc_surface_set_clip( struct window_surface *surface, const RECT *rects, UINT count )
++{
++}
++
++static BOOL xproc_surface_flush( struct window_surface *window_surface, const RECT *rect, const RECT *dirty,
++                                 const BITMAPINFO *color_info, const void *color_bits, BOOL shape_changed,
++                                 const BITMAPINFO *shape_info, const void *shape_bits )
++{
++    struct xproc_surface *surface = get_xproc_surface_ptr( window_surface );
++
++    InterlockedIncrement( &surface->shared->seq );
++    /* wake up the thread owning the top-level window so that it composites the new contents */
++    NtUserPostMessage( surface->root, WM_NULL, 0, 0 );
++    return TRUE;
++}
++
++static void xproc_surface_destroy( struct window_surface *window_surface )
++{
++    struct xproc_surface *surface = get_xproc_surface_ptr( window_surface );
++
++    NtUnmapViewOfSection( GetCurrentProcess(), surface->shared );
++    NtClose( surface->section );
++}
++
++static const struct window_surface_funcs xproc_surface_funcs =
++{
++    .size = sizeof(struct xproc_surface),
++    .set_clip = xproc_surface_set_clip,
++    .flush = xproc_surface_flush,
++    .destroy = xproc_surface_destroy
++};
++
++static struct xproc_surface *create_xproc_surface( HWND hwnd, UINT width, UINT height )
++{
++    char buffer[FIELD_OFFSET( BITMAPINFO, bmiColors[256] )];
++    BITMAPINFO *info = (BITMAPINFO *)buffer;
++    struct window_surface *window_surface;
++    struct xproc_surface *surface;
++    RECT rect = {0, 0, width, height};
++    SIZE_T view_size = XPROC_HEADER_SIZE;
++    void *shared = NULL, *bits;
++    HBITMAP bitmap;
++    HANDLE section;
++
++    if (!(section = open_xproc_section( hwnd, TRUE ))) return NULL;
++    if (NtMapViewOfSection( section, GetCurrentProcess(), &shared, 0, 0, NULL, &view_size,
++                            ViewShare, 0, PAGE_READWRITE ))
++    {
++        NtClose( section );
++        return NULL;
++    }
++
++    memset( info, 0, sizeof(*info) );
++    info->bmiHeader.biSize        = sizeof(info->bmiHeader);
++    info->bmiHeader.biWidth       = width;
++    info->bmiHeader.biHeight      = -(int)height; /* top-down */
++    info->bmiHeader.biPlanes      = 1;
++    info->bmiHeader.biBitCount    = 32;
++    info->bmiHeader.biSizeImage   = get_dib_image_size( info );
++    info->bmiHeader.biCompression = BI_RGB;
++
++    if (!(bitmap = NtGdiCreateDIBSection( 0, section, XPROC_HEADER_SIZE, info, DIB_RGB_COLORS, 0, 0, 0, &bits )) ||
++        !(window_surface = window_surface_create( &xproc_surface_funcs, hwnd, &rect, info, bitmap )))
++    {
++        if (bitmap) NtGdiDeleteObjectApp( bitmap );
++        NtUnmapViewOfSection( GetCurrentProcess(), shared );
++        NtClose( section );
++        return NULL;
++    }
++
++    surface = get_xproc_surface_ptr( window_surface );
++    surface->section = section;
++    surface->shared = shared;
++    surface->root = NtUserGetAncestor( hwnd, GA_ROOT );
++    surface->shared->width = width;
++    surface->shared->height = height;
++    surface->shared->magic = XPROC_MAGIC;
++    register_window_surface( NULL, window_surface );
++
++    TRACE( "created cross-process surface %p for %p (%ux%u)\n", surface, hwnd, width, height );
++    return surface;
++}
++
++/* get the shared surface for a window whose ancestors belong to another process */
++static struct window_surface *get_xproc_surface( HWND hwnd, RECT *device_rect )
++{
++    HWND boundary = hwnd, parent, desktop = get_desktop_window();
++    struct xproc_surface *surface = NULL;
++    DWORD pid, parent_pid;
++    UINT i, width, height;
++    RECT rect;
++
++    get_window_thread( hwnd, &pid );
++    for (;;)
++    {
++        if (!(parent = NtUserGetAncestor( boundary, GA_PARENT )) || parent == desktop) return NULL;
++        get_window_thread( parent, &parent_pid );
++        if (parent_pid != pid) break;
++        boundary = parent;
++    }
++
++    if (!get_window_rect( boundary, &rect, get_thread_dpi() )) return NULL;
++    width = min( max( rect.right - rect.left, 0 ), XPROC_MAX_WIDTH );
++    height = min( max( rect.bottom - rect.top, 0 ), XPROC_MAX_HEIGHT );
++    if (!width || !height) return NULL;
++
++    pthread_mutex_lock( &xproc_lock );
++    for (i = 0; i < ARRAY_SIZE(xproc_surfaces); i++)
++    {
++        struct xproc_surface *entry = xproc_surfaces[i];
++        if (!entry || entry->header.hwnd != boundary) continue;
++        if (entry->header.rect.right == width && entry->header.rect.bottom == height) surface = entry;
++        else
++        {
++            register_window_surface( &entry->header, NULL );
++            window_surface_release( &entry->header );
++            xproc_surfaces[i] = NULL;
++        }
++        break;
++    }
++    if (!surface)
++    {
++        for (i = 0; i < ARRAY_SIZE(xproc_surfaces); i++) if (!xproc_surfaces[i]) break;
++        if (i < ARRAY_SIZE(xproc_surfaces) && (surface = create_xproc_surface( boundary, width, height )))
++            xproc_surfaces[i] = surface;
++    }
++    if (surface) window_surface_add_ref( &surface->header );
++    pthread_mutex_unlock( &xproc_lock );
++
++    if (!surface) return NULL;
++    SetRect( device_rect, rect.left, rect.top, rect.left + width, rect.top + height );
++    return &surface->header;
++}
++
++struct xproc_view
++{
++    HWND hwnd;
++    HANDLE section;
++    struct xproc_shared *shared;
++    LONG seq;
++};
++
++struct xproc_parent
++{
++    HWND top;
++    DWORD ticks;
++    UINT count;
++    HWND children[32];
++};
++
++static struct xproc_view xproc_views[32];
++static struct xproc_parent xproc_parents[8];
++
++static UINT find_xproc_children( HWND parent, DWORD pid, HWND *children, UINT count, UINT max )
++{
++    HWND *list = list_window_children( parent );
++    DWORD child_pid;
++    UINT i;
++
++    for (i = 0; list && list[i]; i++)
++    {
++        get_window_thread( list[i], &child_pid );
++        if (child_pid != pid)
++        {
++            if (count < max) children[count++] = list[i];
++        }
++        else count = find_xproc_children( list[i], pid, children, count, max );
++    }
++    free( list );
++    return count;
++}
++
++static struct xproc_view *get_xproc_view( HWND hwnd )
++{
++    struct xproc_view *view = NULL;
++    SIZE_T size = XPROC_SECTION_SIZE;
++    void *shared = NULL;
++    HANDLE section;
++    UINT i;
++
++    for (i = 0; i < ARRAY_SIZE(xproc_views); i++)
++        if (xproc_views[i].hwnd == hwnd) return &xproc_views[i];
++    for (i = 0; i < ARRAY_SIZE(xproc_views); i++)
++        if (!xproc_views[i].hwnd || !is_window( xproc_views[i].hwnd )) break;
++    if (i == ARRAY_SIZE(xproc_views)) return NULL;
++
++    if (!(section = open_xproc_section( hwnd, FALSE ))) return NULL;
++    if (NtMapViewOfSection( section, GetCurrentProcess(), &shared, 0, 0, NULL, &size, ViewShare, 0, PAGE_READONLY ))
++    {
++        NtClose( section );
++        return NULL;
++    }
++
++    view = &xproc_views[i];
++    if (view->hwnd)
++    {
++        NtUnmapViewOfSection( GetCurrentProcess(), view->shared );
++        NtClose( view->section );
++    }
++    view->hwnd = hwnd;
++    view->section = section;
++    view->shared = shared;
++    view->seq = -1;
++    return view;
++}
++
++static HRGN get_server_visible_region( HWND hwnd, UINT flags, RECT *win_rect, RECT *top_rect )
++{
++    NTSTATUS status;
++    HRGN rgn = 0;
++    size_t size = 256;
++
++    do
++    {
++        RGNDATA *data = malloc( sizeof(*data) + size - 1 );
++        if (!data) return 0;
++
++        SERVER_START_REQ( get_visible_region )
++        {
++            req->window  = wine_server_user_handle( hwnd );
++            req->flags   = flags;
++            wine_server_set_reply( req, data->Buffer, size );
++            if (!(status = wine_server_call( req )))
++            {
++                size_t reply_size = wine_server_reply_size( reply );
++                data->rdh.dwSize   = sizeof(data->rdh);
++                data->rdh.iType    = RDH_RECTANGLES;
++                data->rdh.nCount   = reply_size / sizeof(RECT);
++                data->rdh.nRgnSize = reply_size;
++                rgn = NtGdiExtCreateRegion( NULL, data->rdh.dwSize + data->rdh.nRgnSize, data );
++                *win_rect = wine_server_get_rect( reply->win_rect );
++                *top_rect = wine_server_get_rect( reply->top_rect );
++            }
++            else size = reply->total_size;
++        }
++        SERVER_END_REQ;
++        free( data );
++    } while (status == STATUS_BUFFER_OVERFLOW);
++
++    return rgn;
++}
++
++/* copy the visible parts of cross-process child windows into a top-level window surface */
++static void composite_xproc_children( struct window_surface *surface )
++{
++    char info_buf[FIELD_OFFSET( BITMAPINFO, bmiColors[256] )];
++    BITMAPINFO *info = (BITMAPINFO *)info_buf;
++    struct xproc_parent *parent = NULL;
++    RECT origin, top_win_rect;
++    DWORD now = NtGetTickCount();
++    HRGN rgn, covered, child_region;
++    char *dst_bits;
++    UINT i, j;
++
++    if (surface == &dummy_surface || surface->funcs == &xproc_surface_funcs) return;
++
++    for (i = 0; i < ARRAY_SIZE(xproc_parents); i++)
++        if (xproc_parents[i].top == surface->hwnd) { parent = &xproc_parents[i]; break; }
++    if (!parent)
++    {
++        for (i = 0; i < ARRAY_SIZE(xproc_parents); i++)
++            if (!xproc_parents[i].top || !is_window( xproc_parents[i].top )) break;
++        if (i == ARRAY_SIZE(xproc_parents)) return;
++        parent = &xproc_parents[i];
++        parent->top = surface->hwnd;
++        parent->ticks = now - 1000;
++        parent->count = 0;
++    }
++    if ((int)(now - parent->ticks) >= 500)
++    {
++        parent->count = find_xproc_children( surface->hwnd, GetCurrentProcessId(), parent->children, 0,
++                                             ARRAY_SIZE(parent->children) );
++        parent->ticks = now;
++    }
++    if (!parent->count) return;
++
++    if (!(rgn = get_server_visible_region( surface->hwnd, DCX_WINDOW, &top_win_rect, &origin ))) return;
++    NtGdiDeleteObjectApp( rgn );
++
++    window_surface_lock( surface );
++    if (!(dst_bits = window_surface_get_color( surface, info )) || info->bmiHeader.biBitCount != 32)
++    {
++        window_surface_unlock( surface );
++        return;
++    }
++
++    /* if any child changed, or the parent drew over them, composite all of them again */
++    for (i = 0; i < parent->count; i++)
++    {
++        struct xproc_view *view = get_xproc_view( parent->children[i] );
++        if (view && view->shared->magic == XPROC_MAGIC && view->shared->seq != view->seq) break;
++    }
++    if (i == parent->count && (surface->bounds.left >= surface->bounds.right ||
++                               surface->bounds.top >= surface->bounds.bottom))
++    {
++        window_surface_unlock( surface );
++        return;
++    }
++
++    /* children are listed top to bottom, clip each one by the area covered by those above it */
++    covered = NtGdiCreateRectRgn( 0, 0, 0, 0 );
++    for (i = 0; i < parent->count; i++)
++    {
++        HWND child = parent->children[i];
++        struct xproc_view *view;
++        RECT child_rect, dummy;
++        UINT dst_width = surface->rect.right - surface->rect.left;
++        UINT dst_height = surface->rect.bottom - surface->rect.top;
++        const char *src_bits;
++        RGNDATA *data;
++        DWORD size;
++
++        if (!(view = get_xproc_view( child )) || view->shared->magic != XPROC_MAGIC) continue;
++        if (!(rgn = get_server_visible_region( child, DCX_WINDOW | DCX_CLIPSIBLINGS, &child_rect, &dummy ))) continue;
++        view->seq = view->shared->seq;
++        NtGdiCombineRgn( rgn, rgn, covered, RGN_DIFF );
++        if ((child_region = NtGdiCreateRectRgn( child_rect.left, child_rect.top, child_rect.right, child_rect.bottom )))
++        {
++            NtGdiCombineRgn( covered, covered, child_region, RGN_OR );
++            NtGdiDeleteObjectApp( child_region );
++        }
++
++        src_bits = (const char *)view->shared + XPROC_HEADER_SIZE;
++        if ((size = NtGdiGetRegionData( rgn, 0, NULL )) && (data = malloc( size )))
++        {
++            const RECT *rects = (const RECT *)data->Buffer;
++
++            NtGdiGetRegionData( rgn, size, data );
++            for (j = 0; j < data->rdh.nCount; j++)
++            {
++                RECT rc = rects[j], dst;
++                int y;
++
++                if (!intersect_rect( &rc, &rc, &child_rect )) continue;
++                rc.right = min( rc.right, child_rect.left + view->shared->width );
++                rc.bottom = min( rc.bottom, child_rect.top + view->shared->height );
++                dst = rc;
++                OffsetRect( &dst, -origin.left, -origin.top );
++                dst.left = max( dst.left, 0 );
++                dst.top = max( dst.top, 0 );
++                dst.right = min( dst.right, (LONG)dst_width );
++                dst.bottom = min( dst.bottom, (LONG)dst_height );
++                if (dst.left >= dst.right || dst.top >= dst.bottom) continue;
++
++                for (y = dst.top; y < dst.bottom; y++)
++                {
++                    int src_x = dst.left + origin.left - child_rect.left;
++                    int src_y = y + origin.top - child_rect.top;
++                    memcpy( dst_bits + (SIZE_T)y * dst_width * 4 + dst.left * 4,
++                            src_bits + (SIZE_T)src_y * view->shared->width * 4 + src_x * 4,
++                            (dst.right - dst.left) * 4 );
++                }
++                add_bounds_rect( &surface->bounds, &dst );
++            }
++            free( data );
++        }
++        NtGdiDeleteObjectApp( rgn );
++    }
++    if (covered) NtGdiDeleteObjectApp( covered );
++    window_surface_unlock( surface );
++}
++
+ struct scaled_surface
+ {
+     struct window_surface header;
+@@ -766,7 +1194,10 @@ void flush_window_surfaces( BOOL idle )
+     else if ((int)(now - last_idle) < 50) goto done;
+ 
+     LIST_FOR_EACH_ENTRY( surface, &window_surfaces, struct window_surface, entry )
++    {
++        composite_xproc_children( surface );
+         window_surface_flush( surface );
++    }
+ done:
+     pthread_mutex_unlock( &surfaces_lock );
+ }
+@@ -877,6 +1308,7 @@ static void update_visible_region( struct dce *dce )
+             if (surface) window_surface_add_ref( surface );
+             release_win_ptr( win );
+         }
++        else if (win == WND_OTHER_PROCESS) surface = get_xproc_surface( dce->hwnd, &top_rect );
+     }
+ 
+     if (!surface) SetRectEmpty( &top_rect );

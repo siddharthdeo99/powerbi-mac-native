@@ -1,0 +1,399 @@
+diff --git a/dlls/ncrypt/Makefile.in b/dlls/ncrypt/Makefile.in
+index 86e5773..4b4fa88 100644
+--- a/dlls/ncrypt/Makefile.in
++++ b/dlls/ncrypt/Makefile.in
+@@ -1,6 +1,7 @@
+ IMPORTLIB = ncrypt
+ MODULE    = ncrypt.dll
+ IMPORTS   = bcrypt
++DELAYIMPORTS = crypt32
+ 
+ SOURCES = \
+ 	main.c
+diff --git a/dlls/ncrypt/main.c b/dlls/ncrypt/main.c
+index 03f541c..88aa2ba 100644
+--- a/dlls/ncrypt/main.c
++++ b/dlls/ncrypt/main.c
+@@ -25,7 +25,9 @@
+ #include "windef.h"
+ #include "winbase.h"
+ #include "ncrypt.h"
++#include "ncryptprotect.h"
+ #include "bcrypt.h"
++#include "wincrypt.h"
+ #include "ncrypt_internal.h"
+ #include "wine/debug.h"
+ 
+@@ -601,3 +603,233 @@ SECURITY_STATUS WINAPI NCryptVerifySignature(NCRYPT_KEY_HANDLE handle, void *pad
+     return map_ntstatus(BCryptVerifySignature(key_object->key.bcrypt_key, padding, hash, hash_size, signature,
+                                               signature_size, flags));
+ }
++
++/* DPAPI-NG protection descriptors.
++ *
++ * Secrets are protected with classic DPAPI (CryptProtectData) and wrapped in a Wine-specific
++ * container that also stores the descriptor string. The blobs are therefore not interchangeable
++ * with blobs produced by Windows, and principals other than the current user or machine are
++ * not enforced. */
++
++#define PROTECTED_SECRET_MAGIC 0x5350574e /* "NWPS" */
++
++struct protection_descriptor
++{
++    DWORD magic;
++    BOOL  machine;
++    WCHAR *string;
++};
++
++struct protected_secret_header
++{
++    DWORD magic;
++    DWORD descriptor_len; /* in WCHARs, including the terminator */
++};
++
++static BOOL match_prefix(const WCHAR *str, const WCHAR *prefix, const WCHAR **value)
++{
++    size_t len = wcslen(prefix);
++
++    if (wcsnicmp(str, prefix, len)) return FALSE;
++    *value = str + len;
++    return TRUE;
++}
++
++static SECURITY_STATUS create_descriptor(const WCHAR *string, struct protection_descriptor **ret)
++{
++    struct protection_descriptor *descriptor;
++    const WCHAR *value;
++    BOOL machine = FALSE;
++
++    while (*string == ' ') string++;
++
++    if (match_prefix(string, L"LOCAL=", &value))
++    {
++        if (!wcsicmp(value, L"machine")) machine = TRUE;
++        else if (wcsicmp(value, L"user") && wcsicmp(value, L"logon"))
++        {
++            WARN("unknown LOCAL value %s\n", debugstr_w(value));
++            return NTE_INVALID_PARAMETER;
++        }
++    }
++    else if (match_prefix(string, L"SID=", &value))
++    {
++        if (!*value) return NTE_INVALID_PARAMETER;
++        FIXME("SID %s is not enforced, protecting for the current user\n", debugstr_w(value));
++    }
++    else
++    {
++        FIXME("unsupported descriptor %s\n", debugstr_w(string));
++        return NTE_NOT_SUPPORTED;
++    }
++
++    if (!(descriptor = calloc(1, sizeof(*descriptor)))) return NTE_NO_MEMORY;
++    if (!(descriptor->string = wcsdup(string)))
++    {
++        free(descriptor);
++        return NTE_NO_MEMORY;
++    }
++    descriptor->magic = PROTECTED_SECRET_MAGIC;
++    descriptor->machine = machine;
++    *ret = descriptor;
++    return ERROR_SUCCESS;
++}
++
++static struct protection_descriptor *get_descriptor(NCRYPT_DESCRIPTOR_HANDLE handle)
++{
++    struct protection_descriptor *descriptor = (struct protection_descriptor *)handle;
++
++    if (!descriptor || descriptor->magic != PROTECTED_SECRET_MAGIC) return NULL;
++    return descriptor;
++}
++
++static void *alloc_secret(const NCRYPT_ALLOC_PARA *para, SIZE_T size)
++{
++    if (para && para->pfnAlloc) return para->pfnAlloc(size);
++    return LocalAlloc(LMEM_FIXED, size);
++}
++
++SECURITY_STATUS WINAPI NCryptCreateProtectionDescriptor(const WCHAR *string, DWORD flags,
++                                                        NCRYPT_DESCRIPTOR_HANDLE *handle)
++{
++    struct protection_descriptor *descriptor;
++    SECURITY_STATUS ret;
++
++    TRACE("(%s, %#lx, %p)\n", debugstr_w(string), flags, handle);
++
++    if (!string || !handle) return NTE_INVALID_PARAMETER;
++    if (flags & NCRYPT_NAMED_DESCRIPTOR_FLAG)
++    {
++        FIXME("named descriptors not supported\n");
++        return NTE_NOT_SUPPORTED;
++    }
++
++    if ((ret = create_descriptor(string, &descriptor))) return ret;
++    *handle = (NCRYPT_DESCRIPTOR_HANDLE)descriptor;
++    return ERROR_SUCCESS;
++}
++
++SECURITY_STATUS WINAPI NCryptCloseProtectionDescriptor(NCRYPT_DESCRIPTOR_HANDLE handle)
++{
++    struct protection_descriptor *descriptor = get_descriptor(handle);
++
++    TRACE("(%p)\n", handle);
++
++    if (!descriptor) return NTE_INVALID_HANDLE;
++    descriptor->magic = 0;
++    free(descriptor->string);
++    free(descriptor);
++    return ERROR_SUCCESS;
++}
++
++SECURITY_STATUS WINAPI NCryptProtectSecret(NCRYPT_DESCRIPTOR_HANDLE handle, DWORD flags, const BYTE *data,
++                                           ULONG data_size, const NCRYPT_ALLOC_PARA *para, HWND hwnd,
++                                           BYTE **blob, ULONG *blob_size)
++{
++    struct protection_descriptor *descriptor = get_descriptor(handle);
++    struct protected_secret_header header;
++    DATA_BLOB in, out;
++    DWORD dpapi_flags = CRYPTPROTECT_UI_FORBIDDEN;
++    SIZE_T descriptor_bytes, size;
++    BYTE *ptr;
++
++    TRACE("(%p, %#lx, %p, %lu, %p, %p, %p, %p)\n", handle, flags, data, data_size, para, hwnd, blob, blob_size);
++
++    if (!descriptor) return NTE_INVALID_HANDLE;
++    if (!data || !data_size || !blob || !blob_size) return NTE_INVALID_PARAMETER;
++    if (flags & ~NCRYPT_SILENT_FLAG) FIXME("ignoring flags %#lx\n", flags & ~NCRYPT_SILENT_FLAG);
++    if (descriptor->machine) dpapi_flags |= CRYPTPROTECT_LOCAL_MACHINE;
++
++    in.cbData = data_size;
++    in.pbData = (BYTE *)data;
++    if (!CryptProtectData(&in, NULL, NULL, NULL, NULL, dpapi_flags, &out)) return NTE_FAIL;
++
++    header.magic = PROTECTED_SECRET_MAGIC;
++    header.descriptor_len = wcslen(descriptor->string) + 1;
++    descriptor_bytes = header.descriptor_len * sizeof(WCHAR);
++    size = sizeof(header) + descriptor_bytes + out.cbData;
++
++    if (!(ptr = alloc_secret(para, size)))
++    {
++        LocalFree(out.pbData);
++        return NTE_NO_MEMORY;
++    }
++    memcpy(ptr, &header, sizeof(header));
++    memcpy(ptr + sizeof(header), descriptor->string, descriptor_bytes);
++    memcpy(ptr + sizeof(header) + descriptor_bytes, out.pbData, out.cbData);
++    LocalFree(out.pbData);
++
++    *blob = ptr;
++    *blob_size = size;
++    return ERROR_SUCCESS;
++}
++
++SECURITY_STATUS WINAPI NCryptUnprotectSecret(NCRYPT_DESCRIPTOR_HANDLE *handle, DWORD flags, const BYTE *blob,
++                                             ULONG blob_size, const NCRYPT_ALLOC_PARA *para, HWND hwnd,
++                                             BYTE **data, ULONG *data_size)
++{
++    struct protected_secret_header header;
++    struct protection_descriptor *descriptor = NULL;
++    SIZE_T descriptor_bytes;
++    const WCHAR *string;
++    SECURITY_STATUS ret;
++    DATA_BLOB in, out;
++    BYTE *ptr;
++
++    TRACE("(%p, %#lx, %p, %lu, %p, %p, %p, %p)\n", handle, flags, blob, blob_size, para, hwnd, data, data_size);
++
++    if (!blob || blob_size < sizeof(header)) return NTE_INVALID_PARAMETER;
++    if (flags & ~(NCRYPT_SILENT_FLAG | NCRYPT_UNPROTECT_NO_DECRYPT))
++        FIXME("ignoring flags %#lx\n", flags & ~(NCRYPT_SILENT_FLAG | NCRYPT_UNPROTECT_NO_DECRYPT));
++
++    memcpy(&header, blob, sizeof(header));
++    if (header.magic != PROTECTED_SECRET_MAGIC || !header.descriptor_len) return NTE_BAD_DATA;
++    descriptor_bytes = (SIZE_T)header.descriptor_len * sizeof(WCHAR);
++    if (descriptor_bytes > blob_size - sizeof(header)) return NTE_BAD_DATA;
++    string = (const WCHAR *)(blob + sizeof(header));
++    if (string[header.descriptor_len - 1]) return NTE_BAD_DATA;
++
++    if (handle)
++    {
++        if ((ret = create_descriptor(string, &descriptor))) return ret;
++    }
++
++    if (flags & NCRYPT_UNPROTECT_NO_DECRYPT)
++    {
++        if (handle) *handle = (NCRYPT_DESCRIPTOR_HANDLE)descriptor;
++        return ERROR_SUCCESS;
++    }
++    if (!data || !data_size)
++    {
++        ret = NTE_INVALID_PARAMETER;
++        goto error;
++    }
++
++    in.cbData = blob_size - sizeof(header) - descriptor_bytes;
++    in.pbData = (BYTE *)blob + sizeof(header) + descriptor_bytes;
++    if (!CryptUnprotectData(&in, NULL, NULL, NULL, NULL, CRYPTPROTECT_UI_FORBIDDEN, &out))
++    {
++        ret = NTE_BAD_DATA;
++        goto error;
++    }
++
++    if (!(ptr = alloc_secret(para, out.cbData)))
++    {
++        SecureZeroMemory(out.pbData, out.cbData);
++        LocalFree(out.pbData);
++        ret = NTE_NO_MEMORY;
++        goto error;
++    }
++    memcpy(ptr, out.pbData, out.cbData);
++    *data = ptr;
++    *data_size = out.cbData;
++    SecureZeroMemory(out.pbData, out.cbData);
++    LocalFree(out.pbData);
++
++    if (handle) *handle = (NCRYPT_DESCRIPTOR_HANDLE)descriptor;
++    return ERROR_SUCCESS;
++
++error:
++    if (descriptor) NCryptCloseProtectionDescriptor((NCRYPT_DESCRIPTOR_HANDLE)descriptor);
++    return ret;
++}
+diff --git a/dlls/ncrypt/ncrypt.spec b/dlls/ncrypt/ncrypt.spec
+index 0a362aa..6a7c731 100644
+--- a/dlls/ncrypt/ncrypt.spec
++++ b/dlls/ncrypt/ncrypt.spec
+@@ -58,10 +58,10 @@
+ @ stub GetKeyStorageInterface
+ @ stub GetSChannelInterface
+ @ stub NCryptCloseKeyProtector
+-@ stub NCryptCloseProtectionDescriptor
++@ stdcall NCryptCloseProtectionDescriptor(ptr)
+ @ stub NCryptCreateClaim
+ @ stdcall NCryptCreatePersistedKey(long ptr wstr wstr long long)
+-@ stub NCryptCreateProtectionDescriptor
++@ stdcall NCryptCreateProtectionDescriptor(wstr long ptr)
+ @ stdcall NCryptDecrypt(long ptr long ptr ptr long ptr long)
+ @ stdcall NCryptDeleteKey(long long)
+ @ stub NCryptDeriveKey
+@@ -85,7 +85,7 @@
+ @ stub NCryptOpenKeyProtector
+ @ stdcall NCryptOpenStorageProvider(ptr wstr long)
+ @ stub NCryptProtectKey
+-@ stub NCryptProtectSecret
++@ stdcall NCryptProtectSecret(ptr long ptr long ptr long ptr ptr)
+ @ stub NCryptQueryProtectionDescriptorName
+ @ stub NCryptRegisterProtectionDescriptorName
+ @ stub NCryptSecretAgreement
+@@ -99,7 +99,7 @@
+ @ stub NCryptStreamUpdate
+ @ stub NCryptTranslateHandle
+ @ stub NCryptUnprotectKey
+-@ stub NCryptUnprotectSecret
++@ stdcall NCryptUnprotectSecret(ptr long ptr long ptr long ptr ptr)
+ @ stub NCryptVerifyClaim
+ @ stdcall NCryptVerifySignature(ptr ptr ptr long ptr long long)
+ @ stub SslChangeNotify
+diff --git a/dlls/ncrypt/tests/ncrypt.c b/dlls/ncrypt/tests/ncrypt.c
+index 9f15a6c..0cf1404 100644
+--- a/dlls/ncrypt/tests/ncrypt.c
++++ b/dlls/ncrypt/tests/ncrypt.c
+@@ -21,6 +21,7 @@
+ #include <windef.h>
+ #include <winbase.h>
+ #include <ncrypt.h>
++#include <ncryptprotect.h>
+ #include <bcrypt.h>
+ 
+ #include "wine/test.h"
+@@ -832,6 +833,53 @@ static void test_NCryptExportKey(void)
+     NCryptFreeObject(prov);
+ }
+ 
++static void test_protect_secret(void)
++{
++    static const BYTE secret[] = "Wine protected secret";
++    NCRYPT_DESCRIPTOR_HANDLE descriptor, descriptor2;
++    BYTE *blob, *data;
++    ULONG blob_size, data_size, i;
++    SECURITY_STATUS ret;
++
++    ret = NCryptCreateProtectionDescriptor(L"LOCAL=user", 0, NULL);
++    ok(ret == NTE_INVALID_PARAMETER, "got %#lx\n", ret);
++
++    descriptor = NULL;
++    ret = NCryptCreateProtectionDescriptor(L"LOCAL=user", 0, &descriptor);
++    ok(ret == ERROR_SUCCESS, "got %#lx\n", ret);
++    ok(descriptor != NULL, "got NULL descriptor\n");
++
++    blob = NULL;
++    blob_size = 0;
++    ret = NCryptProtectSecret(descriptor, NCRYPT_SILENT_FLAG, secret, sizeof(secret), NULL, NULL, &blob, &blob_size);
++    ok(ret == ERROR_SUCCESS, "got %#lx\n", ret);
++    ok(blob != NULL, "got NULL blob\n");
++    ok(blob_size > sizeof(secret), "got blob size %lu\n", blob_size);
++    for (i = 0; i + sizeof(secret) <= blob_size; i++)
++        if (!memcmp(blob + i, secret, sizeof(secret))) break;
++    ok(i + sizeof(secret) > blob_size, "secret stored in clear text\n");
++
++    data = NULL;
++    data_size = 0;
++    descriptor2 = NULL;
++    ret = NCryptUnprotectSecret(&descriptor2, NCRYPT_SILENT_FLAG, blob, blob_size, NULL, NULL, &data, &data_size);
++    ok(ret == ERROR_SUCCESS, "got %#lx\n", ret);
++    ok(data_size == sizeof(secret), "got data size %lu\n", data_size);
++    ok(data && !memcmp(data, secret, sizeof(secret)), "secret mismatch\n");
++    ok(descriptor2 != NULL, "got NULL descriptor\n");
++
++    ret = NCryptCloseProtectionDescriptor(descriptor2);
++    ok(ret == ERROR_SUCCESS, "got %#lx\n", ret);
++    LocalFree(data);
++
++    ret = NCryptUnprotectSecret(NULL, 0, blob, 4, NULL, NULL, &data, &data_size);
++    ok(ret == NTE_INVALID_PARAMETER || ret == NTE_BAD_DATA, "got %#lx\n", ret);
++
++    LocalFree(blob);
++    ret = NCryptCloseProtectionDescriptor(descriptor);
++    ok(ret == ERROR_SUCCESS, "got %#lx\n", ret);
++}
++
+ START_TEST(ncrypt)
+ {
+     test_key_import_rsa();
+@@ -844,4 +892,5 @@ START_TEST(ncrypt)
+     test_NCryptIsAlgSupported();
+     test_NCryptEncrypt();
+     test_NCryptExportKey();
++    test_protect_secret();
+ }
+diff --git a/include/Makefile.in b/include/Makefile.in
+index 008736e..35d0b20 100644
+--- a/include/Makefile.in
++++ b/include/Makefile.in
+@@ -734,6 +734,7 @@ SOURCES = \
+ 	natupnp.idl \
+ 	nb30.h \
+ 	ncrypt.h \
++	ncryptprotect.h \
+ 	ndattrib.idl \
+ 	ndfapi.h \
+ 	ndrtypes.h \
+diff --git a/include/ncrypt.h b/include/ncrypt.h
+index 7a1769c..9d30e8d 100644
+--- a/include/ncrypt.h
++++ b/include/ncrypt.h
+@@ -79,6 +79,15 @@ typedef ULONG_PTR NCRYPT_KEY_HANDLE;
+ typedef ULONG_PTR NCRYPT_HASH_HANDLE;
+ typedef ULONG_PTR NCRYPT_SECRET_HANDLE;
+ 
++typedef LPVOID (WINAPI *PFN_NCRYPT_ALLOC)(SIZE_T);
++typedef VOID (WINAPI *PFN_NCRYPT_FREE)(LPVOID);
++
++typedef struct NCRYPT_ALLOC_PARA {
++    DWORD cbSize;
++    PFN_NCRYPT_ALLOC pfnAlloc;
++    PFN_NCRYPT_FREE pfnFree;
++} NCRYPT_ALLOC_PARA;
++
+ #define NCRYPT_KEY_STORAGE_INTERFACE        0x00010001
+ #define NCRYPT_SCHANNEL_INTERFACE           0x00010002
+ #define NCRYPT_SCHANNEL_SIGNATURE_INTERFACE 0x00010003

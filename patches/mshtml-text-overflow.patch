@@ -1,0 +1,105 @@
+diff --git a/dlls/mshtml/htmlstyle.c b/dlls/mshtml/htmlstyle.c
+index 2137c9f..c66307a 100644
+--- a/dlls/mshtml/htmlstyle.c
++++ b/dlls/mshtml/htmlstyle.c
+@@ -670,6 +670,11 @@ static const style_tbl_entry_t style_tbl[] = {
+         DISPID_A_TEXTINDENT,
+         ATTR_FIX_PX
+     },
++    {
++        L"text-overflow",
++        DISPID_IHTMLCSSSTYLEDECLARATION_TEXTOVERFLOW,
++        DISPID_A_TEXTOVERFLOW
++    },
+     {
+         L"text-transform",
+         DISPID_IHTMLCSSSTYLEDECLARATION_TEXTTRANSFORM,
+@@ -4040,15 +4045,15 @@ DISPEX_IDISPATCH_IMPL(HTMLStyle4, IHTMLStyle4, impl_from_IHTMLStyle4(iface)->css
+ static HRESULT WINAPI HTMLStyle4_put_textOverflow(IHTMLStyle4 *iface, BSTR v)
+ {
+     HTMLStyle *This = impl_from_IHTMLStyle4(iface);
+-    FIXME("(%p)->(%s)\n", This, debugstr_w(v));
+-    return E_NOTIMPL;
++    TRACE("(%p)->(%s)\n", This, debugstr_w(v));
++    return set_style_property(&This->css_style, STYLEID_TEXT_OVERFLOW, v);
+ }
+ 
+ static HRESULT WINAPI HTMLStyle4_get_textOverflow(IHTMLStyle4 *iface, BSTR *p)
+ {
+     HTMLStyle *This = impl_from_IHTMLStyle4(iface);
+-    FIXME("(%p)->(%p)\n", This, p);
+-    return E_NOTIMPL;
++    TRACE("(%p)->(%p)\n", This, p);
++    return get_style_property(&This->css_style, STYLEID_TEXT_OVERFLOW, p);
+ }
+ 
+ static HRESULT WINAPI HTMLStyle4_put_minHeight(IHTMLStyle4 *iface, VARIANT v)
+@@ -6419,15 +6424,15 @@ static HRESULT WINAPI HTMLCSSStyleDeclaration_get_textKashidaSpace(IHTMLCSSStyle
+ static HRESULT WINAPI HTMLCSSStyleDeclaration_put_textOverflow(IHTMLCSSStyleDeclaration *iface, BSTR v)
+ {
+     CSSStyle *This = impl_from_IHTMLCSSStyleDeclaration(iface);
+-    FIXME("(%p)->(%s)\n", This, debugstr_w(v));
+-    return E_NOTIMPL;
++    TRACE("(%p)->(%s)\n", This, debugstr_w(v));
++    return set_style_property(This, STYLEID_TEXT_OVERFLOW, v);
+ }
+ 
+ static HRESULT WINAPI HTMLCSSStyleDeclaration_get_textOverflow(IHTMLCSSStyleDeclaration *iface, BSTR *p)
+ {
+     CSSStyle *This = impl_from_IHTMLCSSStyleDeclaration(iface);
+-    FIXME("(%p)->(%p)\n", This, p);
+-    return E_NOTIMPL;
++    TRACE("(%p)->(%p)\n", This, p);
++    return get_style_property(This, STYLEID_TEXT_OVERFLOW, p);
+ }
+ 
+ static HRESULT WINAPI HTMLCSSStyleDeclaration_put_minHeight(IHTMLCSSStyleDeclaration *iface, VARIANT v)
+diff --git a/dlls/mshtml/htmlstyle.h b/dlls/mshtml/htmlstyle.h
+index 0ecd8ec..384553d 100644
+--- a/dlls/mshtml/htmlstyle.h
++++ b/dlls/mshtml/htmlstyle.h
+@@ -137,6 +137,7 @@ typedef enum {
+     STYLEID_TEXT_ALIGN,
+     STYLEID_TEXT_DECORATION,
+     STYLEID_TEXT_INDENT,
++    STYLEID_TEXT_OVERFLOW,
+     STYLEID_TEXT_TRANSFORM,
+     STYLEID_TOP,
+     STYLEID_TRANSFORM,
+diff --git a/dlls/mshtml/nsembed.c b/dlls/mshtml/nsembed.c
+index 62e1922..ef176e1 100644
+--- a/dlls/mshtml/nsembed.c
++++ b/dlls/mshtml/nsembed.c
+@@ -351,6 +351,8 @@ static const nsIDirectoryServiceProvider2Vtbl nsDirectoryServiceProvider2Vtbl =
+ static nsIDirectoryServiceProvider2 nsDirectoryServiceProvider2 =
+     { &nsDirectoryServiceProvider2Vtbl };
+ 
++#define RELAYOUT_TIMER_ID 0x4d53
++
+ static LRESULT WINAPI nsembed_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
+ {
+     GeckoBrowser *This;
+@@ -371,6 +373,23 @@ static LRESULT WINAPI nsembed_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
+                 LOWORD(lParam), HIWORD(lParam), TRUE);
+         if(NS_FAILED(nsres))
+             WARN("SetSize failed: %08lx\n", nsres);
++        /* Gecko may keep a stale layout when it is resized while the window is still hidden
++         * (e.g. a dialog fading in and being rescaled), so resize it again once things settle. */
++        SetTimer(hwnd, RELAYOUT_TIMER_ID, 300, NULL);
++        break;
++
++    case WM_TIMER:
++        if(wParam == RELAYOUT_TIMER_ID) {
++            RECT rect;
++
++            KillTimer(hwnd, RELAYOUT_TIMER_ID);
++            GetClientRect(hwnd, &rect);
++            if(rect.right > 0 && rect.bottom > 0) {
++                nsIBaseWindow_SetSize(This->window, rect.right, rect.bottom + 1, FALSE);
++                nsIBaseWindow_SetSize(This->window, rect.right, rect.bottom, TRUE);
++            }
++            return 0;
++        }
+         break;
+ 
+     case WM_PARENTNOTIFY:

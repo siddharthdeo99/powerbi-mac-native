@@ -1,0 +1,105 @@
+diff --git a/dlls/wintypes/main.c b/dlls/wintypes/main.c
+index d8aa8b6..bcc1297 100644
+--- a/dlls/wintypes/main.c
++++ b/dlls/wintypes/main.c
+@@ -1812,19 +1812,98 @@ HRESULT WINAPI RoIsApiContractMajorVersionPresent(const WCHAR *name, UINT16 majo
+     return S_OK;
+ }
+ 
++static HRESULT append_metadata_path(const WCHAR *path, DWORD *count, HSTRING **paths)
++{
++    HSTRING *new_paths;
++    HRESULT hr;
++
++    if (!(new_paths = CoTaskMemRealloc(*paths, (*count + 1) * sizeof(**paths))))
++        return E_OUTOFMEMORY;
++    *paths = new_paths;
++    if (FAILED(hr = WindowsCreateString(path, wcslen(path), &new_paths[*count])))
++        return hr;
++    (*count)++;
++    return S_OK;
++}
++
++/* Look for <dir>\<namespace>.winmd and for files named after each parent namespace,
++ * most specific first. */
++static HRESULT find_metadata_files(const WCHAR *dir, const WCHAR *name, DWORD *count, HSTRING **paths)
++{
++    WCHAR prefix[MAX_PATH], path[MAX_PATH], *dot;
++    HRESULT hr;
++
++    lstrcpynW(prefix, name, ARRAY_SIZE(prefix));
++    for (;;)
++    {
++        swprintf(path, ARRAY_SIZE(path), L"%s\\%s.winmd", dir, prefix);
++        if (GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES)
++        {
++            TRACE("found %s\n", debugstr_w(path));
++            if (FAILED(hr = append_metadata_path(path, count, paths))) return hr;
++        }
++        if (!(dot = wcsrchr(prefix, '.'))) break;
++        *dot = 0;
++    }
++    return S_OK;
++}
++
+ HRESULT WINAPI RoResolveNamespace(HSTRING name, HSTRING windowsMetaDataDir,
+                                   DWORD packageGraphDirsCount, const HSTRING *packageGraphDirs,
+                                   DWORD *metaDataFilePathsCount, HSTRING **metaDataFilePaths,
+                                   DWORD *subNamespacesCount, HSTRING **subNamespaces)
+ {
+-    FIXME("name %s, windowsMetaDataDir %s, metaDataFilePaths %p, subNamespaces %p stub!\n",
++    const WCHAR *namespace = WindowsGetStringRawBuffer(name, NULL);
++    WCHAR dir[MAX_PATH];
++    HSTRING *paths = NULL;
++    DWORD count = 0, i;
++    HRESULT hr = S_OK;
++
++    TRACE("name %s, windowsMetaDataDir %s, metaDataFilePaths %p, subNamespaces %p\n",
+             debugstr_hstring(name), debugstr_hstring(windowsMetaDataDir),
+             metaDataFilePaths, subNamespaces);
+ 
+     if (!metaDataFilePaths && !subNamespaces)
+         return E_INVALIDARG;
++    if (!*namespace || wcslen(namespace) >= MAX_PATH - 16)
++        return E_INVALIDARG;
+ 
+-    return RO_E_METADATA_NAME_NOT_FOUND;
++    if (subNamespaces)
++    {
++        FIXME("sub namespaces are not supported\n");
++        *subNamespaces = NULL;
++        if (subNamespacesCount) *subNamespacesCount = 0;
++    }
++    if (!metaDataFilePaths)
++        return S_OK;
++    *metaDataFilePaths = NULL;
++    if (metaDataFilePathsCount) *metaDataFilePathsCount = 0;
++
++    if (WindowsGetStringLen(windowsMetaDataDir))
++        lstrcpynW(dir, WindowsGetStringRawBuffer(windowsMetaDataDir, NULL), ARRAY_SIZE(dir));
++    else
++    {
++        GetSystemDirectoryW(dir, ARRAY_SIZE(dir));
++        wcscat(dir, L"\\WinMetadata");
++    }
++    hr = find_metadata_files(dir, namespace, &count, &paths);
++
++    for (i = 0; SUCCEEDED(hr) && i < packageGraphDirsCount; i++)
++    {
++        lstrcpynW(dir, WindowsGetStringRawBuffer(packageGraphDirs[i], NULL), ARRAY_SIZE(dir));
++        hr = find_metadata_files(dir, namespace, &count, &paths);
++    }
++
++    if (FAILED(hr) || !count)
++    {
++        for (i = 0; i < count; i++) WindowsDeleteString(paths[i]);
++        CoTaskMemFree(paths);
++        return FAILED(hr) ? hr : RO_E_METADATA_NAME_NOT_FOUND;
++    }
++
++    *metaDataFilePaths = paths;
++    if (metaDataFilePathsCount) *metaDataFilePathsCount = count;
++    return S_OK;
+ }
+ 
+ struct parse_type_context

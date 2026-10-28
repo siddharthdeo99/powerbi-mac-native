@@ -1,0 +1,16 @@
+diff --git a/dlls/secur32/lsa.c b/dlls/secur32/lsa.c
+index e3336a6..034ec65 100644
+--- a/dlls/secur32/lsa.c
++++ b/dlls/secur32/lsa.c
+@@ -315,8 +315,10 @@ NTSTATUS WINAPI LsaEnumerateLogonSessions(PULONG LogonSessionCount,
+ 
+ NTSTATUS WINAPI LsaFreeReturnBuffer(PVOID buffer)
+ {
++    SIZE_T size = 0;
++
+     TRACE("%p\n", buffer);
+-    return VirtualFree(buffer, 0, MEM_RELEASE);
++    return NtFreeVirtualMemory(GetCurrentProcess(), &buffer, &size, MEM_RELEASE);
+ }
+ 
+ NTSTATUS WINAPI LsaGetLogonSessionData(PLUID LogonId,

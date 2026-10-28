@@ -1,0 +1,63 @@
+diff --git a/dlls/ntdll/unix/process.c b/dlls/ntdll/unix/process.c
+index 9dad6c3..506b3d3 100644
+--- a/dlls/ntdll/unix/process.c
++++ b/dlls/ntdll/unix/process.c
+@@ -993,6 +993,9 @@ void fill_vm_counters( VM_COUNTERS_EX *pvmi, int unix_pid )
+ #if defined(MACH_TASK_BASIC_INFO)
+     struct mach_task_basic_info info;
+     mach_msg_type_number_t infoCount;
++#ifdef TASK_VM_INFO
++    task_vm_info_data_t vm_info;
++#endif
+ 
+     if (unix_pid != -1) return; /* FIXME: Retrieve information for other processes. */
+ 
+@@ -1004,6 +1007,16 @@ void fill_vm_counters( VM_COUNTERS_EX *pvmi, int unix_pid )
+         pvmi->WorkingSetSize = info.resident_size;
+         pvmi->PeakWorkingSetSize = info.resident_size_max;
+     }
++#ifdef TASK_VM_INFO
++    /* virtual_size includes all reserved address space, which is huge for Wine processes;
++     * the physical footprint is the closest equivalent of the Windows commit charge. */
++    infoCount = TASK_VM_INFO_COUNT;
++    if (task_info( mach_task_self(), TASK_VM_INFO, (task_info_t)&vm_info, &infoCount ) == KERN_SUCCESS)
++    {
++        pvmi->PagefileUsage = vm_info.phys_footprint;
++        pvmi->PeakPagefileUsage = max( pvmi->PeakPagefileUsage, vm_info.phys_footprint );
++    }
++#endif
+ #endif
+ }
+ 
+diff --git a/dlls/ntdll/unix/security.c b/dlls/ntdll/unix/security.c
+index 1e1b4f8..7be341d 100644
+--- a/dlls/ntdll/unix/security.c
++++ b/dlls/ntdll/unix/security.c
+@@ -887,8 +887,25 @@ NTSTATUS WINAPI NtPrivilegeCheck( HANDLE token, PRIVILEGE_SET *privs, BOOLEAN *r
+  */
+ NTSTATUS WINAPI NtImpersonateAnonymousToken( HANDLE thread )
+ {
+-    FIXME( "(%p): stub\n", thread );
+-    return STATUS_NOT_IMPLEMENTED;
++    SECURITY_QUALITY_OF_SERVICE qos = { sizeof(qos), SecurityImpersonation, SECURITY_STATIC_TRACKING, FALSE };
++    OBJECT_ATTRIBUTES attr;
++    HANDLE process_token, token;
++    NTSTATUS status;
++
++    FIXME( "(%p): semi-stub, impersonating a copy of the process token\n", thread );
++
++    if ((status = NtOpenProcessToken( NtCurrentProcess(), TOKEN_DUPLICATE, &process_token ))) return status;
++
++    InitializeObjectAttributes( &attr, NULL, 0, NULL, NULL );
++    attr.SecurityQualityOfService = &qos;
++    status = NtDuplicateToken( process_token, TOKEN_IMPERSONATE | TOKEN_QUERY, &attr, FALSE,
++                               TokenImpersonation, &token );
++    NtClose( process_token );
++    if (status) return status;
++
++    status = NtSetInformationThread( thread, ThreadImpersonationToken, &token, sizeof(token) );
++    NtClose( token );
++    return status;
+ }
+ 
+ 

@@ -1,0 +1,14 @@
+# Wine source tree with local patches (kept out of this repo; see patches/)
+/wine/
+
+# Wine build trees (hundreds of MB of artifacts)
+/wine-build/
+/wine-build64/
+
+# Wine prefix and runtime (installed apps, logs, backups)
+/pbi-prefix/
+/runtime/
+
+# Scratch
+*.log
+.DS_Store
