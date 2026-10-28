@@ -3,8 +3,18 @@
 #   ./run_powerbi.sh          normal start (no diagnostics, fastest)
 #   ./run_powerbi.sh --debug  start with Wine error logging into runtime/powerbi.log
 #   ./run_powerbi.sh --stop   stop Power BI and every Wine process
+#
+# Install location is resolved as: $PBI_MAC_HOME, else the legacy
+# ~/reverengineer dev layout, else ~/powerbi-mac-native (what setup.sh creates).
 
-BASE="$HOME/reverengineer"
+if [[ -n "${PBI_MAC_HOME:-}" ]]; then
+    BASE="$PBI_MAC_HOME"
+elif [[ -d "$HOME/reverengineer/runtime/Wine Devel.app" ]]; then
+    BASE="$HOME/reverengineer"
+else
+    BASE="$HOME/powerbi-mac-native"
+fi
+
 RUNTIME="$BASE/runtime"
 WINE_BIN="$RUNTIME/Wine Devel.app/Contents/Resources/wine/bin"
 PBI_BIN="$BASE/pbi-prefix/drive_c/Program Files/Microsoft Power BI Desktop/bin"
@@ -33,7 +43,7 @@ else
     export WINEDEBUG=-all
 fi
 
-cd "$PBI_BIN" || exit 1
+cd "$PBI_BIN" || { echo "Power BI not found at $PBI_BIN — run scripts/setup.sh first."; exit 1; }
 nohup wine zz_pbiharness.exe > "$LOG" 2>&1 &
 echo "Power BI is starting (log: $LOG). It takes about 20-30 seconds."
 

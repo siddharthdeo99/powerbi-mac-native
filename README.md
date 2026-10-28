@@ -11,12 +11,29 @@ source tiles, sign-in, options), the analysis engine (msmdsrv) answers DAX over
 directly (the harness launcher works), Microsoft sign-in TLS, full report-canvas
 rendering. See [docs/HANDOFF.md](docs/HANDOFF.md) for the full, dated status.
 
+## Quick start (one command)
+
+```bash
+git clone https://github.com/siddharthdeo99/powerbi-mac-native.git
+cd powerbi-mac-native/scripts
+./setup.sh          # 30–60 min, mostly unattended; ~15 GB disk
+./run_powerbi.sh
+```
+
+`setup.sh` downloads and verifies **Gcenx wine-devel 11.18**, the **prebuilt
+patched binaries** from [release v0.1](https://github.com/siddharthdeo99/powerbi-mac-native/releases/tag/v0.1),
+a Win10 prefix with **.NET 4.8 + WebView2** (winetricks), **Power BI Desktop**
+from Microsoft, and applies every registry tweak. Requirements: macOS (Apple
+Silicon or Intel), Homebrew for winetricks. Power BI itself is not
+redistributed — the script fetches it from Microsoft's official link.
+
 ## How it works
 
 A prebuilt Gcenx Wine Devel 11.18 runtime, with patched PE/Unix DLLs copied
-into it, running Power BI in a Win10 prefix. Three moving parts live outside
-this repo (Wine source with the patches applied, two build trees, the prefix) —
-this repo holds the **patches, scripts, and the whole paper trail**.
+into it, running Power BI in a Win10 prefix. The patched binaries (9 files) are
+published as [release v0.1](https://github.com/siddharthdeo99/powerbi-mac-native/releases/tag/v0.1)
+so nobody has to build Wine; building them yourself from `patches/` is
+documented below.
 
 ## Patches (`patches/`)
 
