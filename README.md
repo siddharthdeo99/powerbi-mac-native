@@ -1,44 +1,110 @@
 # Power BI Desktop on macOS via patched Wine
 
-Reverse-engineering project that gets **Microsoft Power BI Desktop** running on
-Apple Silicon macOS (M1, 8 GB RAM) through Wine 11.18, by fixing the Wine bugs
-Power BI hits — mostly found by diffing behavior against Windows and reading
-`msedge.dll` / `msolap.dll` in a disassembler.
+This project runs **Microsoft Power BI Desktop on Apple Silicon macOS** (tested
+on M1, 8 GB RAM) through Wine 11.18. It works by fixing a series of Wine bugs
+that Power BI hits — each one found by reverse-engineering `msedge.dll`,
+`msolap.dll` and friends and comparing behavior with Windows. This repo ships
+the resulting patched binaries, a one-command installer, and the full
+investigation log.
 
-**Current state:** the Power BI Desktop Home screen renders and works (data
-source tiles, sign-in, options), the analysis engine (msmdsrv) answers DAX over
-1M rows, and report web views load. Open items: launching `PBIDesktop.exe`
-directly (the harness launcher works), Microsoft sign-in TLS, full report-canvas
-rendering. See [docs/HANDOFF.md](docs/HANDOFF.md) for the full, dated status.
+---
 
-## Quick start (one command)
+## Run Power BI on your Mac
+
+### What you need
+
+- A Mac on **macOS 12+** (Apple Silicon **or** Intel — Intel runs it natively, Apple Silicon via Rosetta, installed automatically)
+- **~15 GB free disk space** (Wine + prefix + .NET + Power BI)
+- Internet (one-time downloads: Wine ~350 MB, .NET/WebView2 ~1 GB, Power BI ~700 MB)
+- 30–60 minutes for the first install — **mostly unattended**; the .NET step alone is 10–30 min
+
+### What works today
+
+| ✅ Works | ❌ Not yet |
+|---|---|
+| Power BI Home screen (data source tiles, options, recent) | **Microsoft account sign-in** and online data sources (TLS bug in Wine's schannel) |
+| Opening PBIX / local data, the data model | Launching `PBIDesktop.exe` directly — use the included launcher |
+| DAX queries over 1M+ rows (msmdsrv engine) | Full report-canvas GPU rendering (visuals render via a fallback path) |
+| Power Query Navigator, load sample data | |
+
+### Step 1 — Install Homebrew (skip if you have it)
+
+```bash
+/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+```
+
+Only needed for `winetricks`, which the installer uses.
+
+### Step 2 — Get this project
 
 ```bash
 git clone https://github.com/siddharthdeo99/powerbi-mac-native.git
 cd powerbi-mac-native/scripts
-./setup.sh          # 30–60 min, mostly unattended; ~15 GB disk
+```
+
+No git? Click the green **Code** button on the repo page → **Download ZIP** →
+unzip → open the `scripts` folder in Terminal.
+
+### Step 3 — Run the installer
+
+```bash
+./setup.sh
+```
+
+One command, no questions asked. It:
+
+1. Downloads and checksum-verifies **Gcenx wine-devel 11.18**
+2. Downloads and checksum-verifies our **prebuilt patched Wine binaries**
+   ([release v0.1](https://github.com/siddharthdeo99/powerbi-mac-native/releases/tag/v0.1)) — no compiling
+3. Builds a Windows 10 prefix with **.NET 4.8 + WebView2** (winetricks — the long step)
+4. Downloads **Power BI Desktop from Microsoft** and installs it silently
+5. Applies every fix (registry tweaks, font substitution, WebView2 settings)
+6. Installs the launcher into Power BI's folder
+
+Everything lands in `~/powerbi-mac-native/`. If the script stops partway,
+**re-run it** — finished steps are skipped. If the Power BI installer falls
+back to a GUI window, click through it and re-run `./setup.sh` to finish.
+
+### Step 4 — Launch
+
+```bash
 ./run_powerbi.sh
 ```
 
-`setup.sh` downloads and verifies **Gcenx wine-devel 11.18**, the **prebuilt
-patched binaries** from [release v0.1](https://github.com/siddharthdeo99/powerbi-mac-native/releases/tag/v0.1),
-a Win10 prefix with **.NET 4.8 + WebView2** (winetricks), **Power BI Desktop**
-from Microsoft, and applies every registry tweak. Requirements: macOS (Apple
-Silicon or Intel), Homebrew for winetricks. Power BI itself is not
-redistributed — the script fetches it from Microsoft's official link.
+The Power BI window appears in 20–30 seconds. Logs go to
+`~/powerbi-mac-native/runtime/powerbi.log`.
 
-## How it works
+```bash
+./run_powerbi.sh --debug   # launch with Wine error logging
+./run_powerbi.sh --stop    # kill Power BI and every Wine process
+```
 
-A prebuilt Gcenx Wine Devel 11.18 runtime, with patched PE/Unix DLLs copied
-into it, running Power BI in a Win10 prefix. The patched binaries (9 files) are
-published as [release v0.1](https://github.com/siddharthdeo99/powerbi-mac-native/releases/tag/v0.1)
-so nobody has to build Wine; building them yourself from `patches/` is
-documented below.
+### If something goes wrong
 
-## Patches (`patches/`)
+| Symptom | Fix |
+|---|---|
+| "Power BI not found … run setup.sh first" | `setup.sh` didn't complete — re-run it |
+| Nothing appears after 60 s | `./run_powerbi.sh --debug`, then check the tail of `runtime/powerbi.log` |
+| Engine reports out of memory | Close Chrome/Teams/Slack first (8 GB Macs swap heavily), then `--stop` and relaunch |
+| Free disk space ran out | The install needs ~15 GB; check **About This Mac → Storage** and re-run `./setup.sh` |
+| Went to sleep mid-install | Just re-run `./setup.sh` |
 
-Each file is a `git diff` against wine-11.18; apply with `git apply <file>`
-inside a Wine 11.18 checkout.
+To remove everything: `rm -rf ~/powerbi-mac-native` — nothing outside that
+folder is touched (plus whatever Homebrew packages you let it install).
+
+---
+
+## What's under the hood
+
+A prebuilt Gcenx Wine Devel 11.18 runtime with nine patched Wine files copied
+into it (published, checksummed, on
+[release v0.1](https://github.com/siddharthdeo99/powerbi-mac-native/releases/tag/v0.1)),
+running Power BI in a Win10 prefix. You never build anything unless you want to.
+
+## The patches (`patches/`)
+
+Each file is a `git diff` against the wine-11.18 tag; apply with
+`git apply <file>` inside a Wine 11.18 checkout.
 
 | Patch | Component | What it fixes |
 |---|---|---|
@@ -54,25 +120,25 @@ inside a Wine 11.18 checkout.
 
 ## Scripts (`scripts/`)
 
-- **`run_powerbi.sh`** — launch Power BI through the patched runtime
-  (`--debug` for Wine logging, `--stop` to kill everything).
-  Requires the layout from `docs/HANDOFF.md` under `~/reverengineer`
-  (Wine runtime, `pbi-prefix`, `/opt/homebrew/bin` on PATH for `ntlm_auth`).
-- **`build-dll.sh`** — rebuild one patched DLL into the arm64 build tree.
-  (The x86_64 `win32u.so` build has extra FreeType/Vulkan config flags — see HANDOFF §13.)
+- **`setup.sh`** — the installer described above. Re-run any time; idempotent.
+- **`run_powerbi.sh`** — launch / `--debug` / `--stop`. Install location resolves
+  as `$PBI_MAC_HOME` → `~/powerbi-mac-native`.
+- **`build-dll.sh`** — for maintainers: rebuild one patched DLL into the arm64
+  build tree and install it (the x86_64 `win32u.so` case has extra flags —
+  see HANDOFF §13).
 
 ## Documentation (`docs/`)
 
 - **[HANDOFF.md](docs/HANDOFF.md)** — the canonical, dated log of all 17 fixes:
   root causes (with RVAs), fixes, verification steps, gotchas, and pending items.
-  **Start here.**
+  **Start here if you want to understand any fix.**
 - `docs/analysis/` — porting requirements, Wine architecture and DLL-structure
   notes made while scoping the project.
 - `docs/archive/` — the stop-time-fix investigation trail: intermediate
   solutions, instructions, and one-off fix scripts, kept for history. The final
   story is HANDOFF §9 + `patches/oleaut32-variant-maxdate-rounding.patch`.
 
-## Building the patches
+## Building the patches yourself
 
 ```bash
 git clone --branch wine-11.18 https://gitlab.winehq.org/wine/wine.git wine
@@ -86,15 +152,11 @@ Copy the built DLL into the Wine runtime's
 `Contents/Resources/wine/lib/wine/x86_64-windows/` (keep a backup of the stock
 file first).
 
-## Status dashboard
+Several fixes (dcomp, ntdll, wintypes) are candidates to upstream to Wine.
 
-| Works | Pending |
-|---|---|
-| Home screen, engine + DAX over 1M rows, WebView2 UI (win7 override), model load, NTLM login | `PBIDesktop.exe` direct launch, Microsoft sign-in TLS 1.2/1.3, full report canvas, 8 GB RAM pressure |
-
-Several of these fixes (dcomp, ntdll, wintypes) are candidates to upstream to
-Wine.
+---
 
 *Personal research project. Power BI is a Microsoft trademark; this repo
 contains no Microsoft code — only patches to Wine (LGPL 2.1) and original
-documentation.*
+documentation. The setup script downloads Power BI from Microsoft and Wine
+from Gcenx's official builds; you use them under their respective licenses.*
